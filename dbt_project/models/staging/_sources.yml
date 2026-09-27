@@ -1,0 +1,15 @@
+version: 2
+
+sources:
+  - name: github
+    description: Raw GitHub REST API payloads, loaded untransformed by load/load_to_duckdb.py.
+    schema: raw
+    tables:
+      - name: raw_issues
+        description: Issues and PRs (GitHub returns PRs from the issues endpoint). May contain duplicates across the windowed and open-issue streams.
+      - name: raw_comments
+        description: Issue comments from the repo-level comments endpoint.
+      - name: raw_events
+        description: Issue events (labeled, closed, reopened, ...) from the repo-level events endpoint.
+      - name: raw_extraction_runs
+        description: One manifest per repo for the latest completed extraction run.

@@ -1,0 +1,30 @@
+name: github_reverse_etl
+version: "1.0.0"
+config-version: 2
+profile: github_reverse_etl
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+clean-targets: ["target", "dbt_packages"]
+
+vars:
+  # Must match reverse_etl.marker in config/pipeline.yml (enforced by tests/test_config_consistency.py).
+  stale_marker: "reverse-etl:stale-flag"
+  stale_label: stale
+  stale_days_default: 30
+  # Per-repo overrides. The sandbox is seeded with brand-new issues, so it uses 0 for the demo.
+  stale_days_by_repo:
+    Darren-Murphy-mtn/Reverse-ETL-sandbox: 0
+
+models:
+  github_reverse_etl:
+    staging:
+      +schema: staging
+      +materialized: view
+    intermediate:
+      +schema: intermediate
+      +materialized: table
+    marts:
+      +schema: marts
+      +materialized: table

@@ -1,0 +1,69 @@
+version: 2
+
+models:
+  - name: stg_extraction_runs
+    description: Latest extraction run per repo. Carries the window and snapshot time that downstream models measure against.
+    columns:
+      - name: repo_full_name
+        data_tests: [unique, not_null]
+      - name: window_start
+        data_tests: [not_null]
+      - name: snapshot_at
+        data_tests: [not_null]
+
+  - name: stg_issues
+    description: One row per issue or PR, deduplicated across extraction streams, typed and renamed.
+    columns:
+      - name: issue_id
+        description: Natural key "<owner>/<repo>#<number>". Used because comments only reference their issue by URL, never by GitHub's numeric id.
+        data_tests: [unique, not_null]
+      - name: github_issue_id
+        description: GitHub's global numeric id.
+      - name: state
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [open, closed]
+      - name: is_pull_request
+        description: GitHub returns PRs from the issues endpoint; true when the pull_request key is present.
+      - name: created_at
+        data_tests: [not_null]
+
+  - name: stg_comments
+    description: One row per issue comment. The issue key is parsed from issue_url.
+    columns:
+      - name: comment_id
+        data_tests: [unique, not_null]
+      - name: issue_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_issues')
+                field: issue_id
+      - name: body_length
+        description: Character length of the comment body. The body itself isn't carried past raw.
+      - name: has_sync_marker
+        description: Comment contains the reverse-ETL stale-flag marker, meaning it was written by this pipeline.
+
+  - name: stg_events
+    description: One row per issue event (labeled, closed, reopened, referenced, ...).
+    columns:
+      - name: event_id
+        data_tests: [unique, not_null]
+      - name: issue_id
+        description: >
+          Can legitimately reference issues outside the extracted set. Some events (e.g. `referenced`
+          from a commit) don't bump the parent issue's updated_at, so the parent may fall outside the
+          windowed issue pull. Set to warn, and the intermediate layer joins these orphans away.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_issues')
+                field: issue_id
+              config:
+                severity: warn
+      - name: event_type
+        data_tests: [not_null]
