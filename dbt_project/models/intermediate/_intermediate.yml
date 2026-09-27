@@ -1,0 +1,27 @@
+version: 2
+
+models:
+  - name: int_issue_lifecycle
+    description: >
+      One row per issue or PR. Joins comments and events onto issues to derive first-response
+      time, reopen count, label history, and last human activity. Bot activity and the
+      pipeline's own stale-flag writes are excluded from "activity".
+    columns:
+      - name: issue_id
+        description: Natural key, "<owner>/<repo>#<number>".
+        data_tests: [unique, not_null]
+      - name: first_response_at
+        description: First comment by a non-bot other than the issue author.
+      - name: hours_to_first_response
+        description: Hours from creation to first_response_at; null if no response yet.
+      - name: reopen_count
+        description: Number of `reopened` events observed in the extraction window.
+      - name: label_history
+        description: Ordered label changes in the window, e.g. "+bug > +triage > -triage".
+      - name: has_stale_flag
+        description: True if a previous reverse-ETL sync already posted the stale-flag comment.
+      - name: last_activity_at
+        description: Latest human comment or event; floored at window_start (see last_activity_is_lower_bound).
+        data_tests: [not_null]
+      - name: last_activity_is_lower_bound
+        description: True when no activity was observed inside the window, so staleness is at least (snapshot_at - window_start).

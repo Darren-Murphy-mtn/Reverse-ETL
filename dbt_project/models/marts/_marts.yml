@@ -1,0 +1,42 @@
+version: 2
+
+models:
+  - name: fct_issue_resolution_time
+    description: Issues and PRs closed inside the extraction window, with resolution time and bucket.
+    columns:
+      - name: issue_id
+        data_tests: [unique, not_null]
+      - name: resolution_hours
+        description: Hours from creation to the final close.
+        data_tests: [not_null]
+      - name: resolution_bucket
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [same_day, under_1_week, under_1_month, over_1_month]
+
+  - name: fct_contributor_activity
+    description: Issues opened, issues closed, and comments posted per contributor per repo per week (window only).
+    columns:
+      - name: contributor_week_id
+        description: Grain key, "<repo>|<contributor>|<week start>".
+        data_tests: [unique, not_null]
+      - name: activity_week
+        description: Monday of the ISO week.
+        data_tests: [not_null]
+
+  - name: fct_stale_issues
+    description: >
+      Open issues (PRs excluded) with no human activity for at least their repo's threshold,
+      measured at the extraction snapshot rather than query time. Source table for the reverse-ETL sync.
+    columns:
+      - name: issue_id
+        data_tests: [unique, not_null]
+      - name: days_since_last_activity
+        description: Whole days from last_activity_at to snapshot_at. A lower bound when last_activity_is_lower_bound.
+        data_tests: [not_null]
+      - name: has_stale_flag
+        description: Already flagged according to the warehouse snapshot. The sync script re-checks live before writing.
+      - name: snapshot_at
+        description: When the repo was extracted. The sync refuses to run on snapshots older than max_snapshot_age_hours.
+        data_tests: [not_null]
