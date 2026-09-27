@@ -1,0 +1,26 @@
+# Single source of truth for the Python side of the pipeline.
+# dbt-side thresholds live in dbt_project/dbt_project.yml (vars); tests/test_config_consistency.py
+# fails CI if the two drift.
+
+source_repos:
+  - vercel/next.js
+  - pytorch/pytorch
+  - dbt-labs/dbt-core
+
+# The only repo the pipeline is ever allowed to write to. It is also extracted,
+# so the loop closes on the same repo: GitHub -> warehouse -> GitHub.
+sandbox_repo: Darren-Murphy-mtn/Reverse-ETL-sandbox
+
+window_days: 180
+
+paths:
+  raw_json: data/raw/json
+  raw_parquet: data/raw/parquet
+  warehouse: warehouse.duckdb
+  sync_logs: logs/reverse_etl
+
+reverse_etl:
+  marker: "<!-- reverse-etl:stale-flag -->"
+  stale_label: stale
+  max_snapshot_age_hours: 24
+  write_delay_seconds: 1.0

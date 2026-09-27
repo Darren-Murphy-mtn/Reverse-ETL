@@ -1,0 +1,21 @@
+# secrets
+.env
+
+# pipeline outputs (regenerable; raw JSON is kept locally as the audit trail)
+data/
+logs/
+*.duckdb
+*.duckdb.wal
+
+# dbt
+dbt_project/target/
+dbt_project/logs/
+dbt_project/dbt_packages/
+dbt_project/.user.yml
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
