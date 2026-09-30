@@ -1,0 +1,240 @@
+diff --git a/README.md b/README.md
+index fb07d6c..a5fb8e2 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,7 @@
+ # GitHub ELT + Reverse ETL
+ 
++[![ci](https://github.com/Darren-Murphy-mtn/Reverse-ETL/actions/workflows/ci.yml/badge.svg)](https://github.com/Darren-Murphy-mtn/Reverse-ETL/actions/workflows/ci.yml)
++
+ A small, complete data pipeline over GitHub issue activity. It **extracts** issues, comments, and events from the GitHub REST API, **loads** them untouched into DuckDB, **transforms** them with dbt into tested marts, then runs **reverse ETL**: each row of `fct_stale_issues` becomes a task in a ClickUp list.
+ 
+ GitHub is read-only. The warehouse computes something no single API call can (last *human* activity, excluding bots), and pushes that answer to where someone would act on it.
+@@ -27,10 +29,13 @@ This is a portfolio-scale project built with free, local tooling. It's meant to
+                                    marts.fct_stale_issues
+                                               │
+       reverse_etl/sync_stale_issues.py        ▼
+-          dry-run by default · one ClickUp list · idempotent · freshness-guarded · logged
++          dry-run by default · idempotent · freshness-guarded · rate-limit aware · logged
++                              │
++      reverse_etl/organize_clickup.py    folder + one list per repo · tags · priority
+                               │
++      reverse_etl/backfill_dates.py      start date (GitHub created) · due (stale by)
+                               ▼
+-                  ClickUp list (one task per stale issue)
++            ClickUp folder "Stale issues" — one task per stale issue
+ ```
+ 
+ `pytorch/pytorch` is not in the extract. Its quiet-open set is about 13,000 issues, which is the wrong volume to write into one demo list. The window is 30 days, the shortest span that still supports the 30-day stale rule.
+diff --git a/dbt_project/macros/has_column.sql b/dbt_project/macros/has_column.sql
+new file mode 100644
+index 0000000..03efd9c
+--- /dev/null
++++ b/dbt_project/macros/has_column.sql
+@@ -0,0 +1,17 @@
++{# True when `column_name` exists on `relation`.
++
++   GitHub omits optional keys entirely rather than sending nulls: `pull_request` appears only
++   on pull requests, `label` only on labeled/unlabeled events. read_json(union_by_name) creates
++   a column only if at least one record in the whole corpus carries the key, so an extraction
++   with no PRs (e.g. --repos <sandbox>) or no label events produces Parquet without them and
++   any model referencing them fails to bind. Guard those references with this macro.
++
++   Returns false during parsing, when the relation can't be inspected; the guarded branch still
++   compiles, and the real value is resolved at run time. #}
++{% macro has_column(relation, column_name) -%}
++    {%- if not execute -%}
++        {{ return(false) }}
++    {%- endif -%}
++    {%- set columns = adapter.get_columns_in_relation(relation) | map(attribute='name') | map('lower') | list -%}
++    {{ return(column_name | lower in columns) }}
++{%- endmacro %}
+diff --git a/dbt_project/models/staging/stg_events.sql b/dbt_project/models/staging/stg_events.sql
+index f8d5d19..15824c3 100644
+--- a/dbt_project/models/staging/stg_events.sql
++++ b/dbt_project/models/staging/stg_events.sql
+@@ -12,7 +12,12 @@ renamed as (
+         coalesce(actor.login, 'ghost') as actor,
+         coalesce(actor.type = 'Bot', false) as actor_is_bot,
+         cast(created_at as timestamp) as created_at,
+-        label.name as label_name
++        -- `label` only exists when the extraction contains a labeled/unlabeled event.
++        {% if has_column(source('github', 'raw_events'), 'label') -%}
++            label.name
++        {%- else -%}
++            cast(null as varchar)
++        {%- endif %} as label_name
+     from source
+ )
+ 
+diff --git a/dbt_project/models/staging/stg_issues.sql b/dbt_project/models/staging/stg_issues.sql
+index b24292b..82565f5 100644
+--- a/dbt_project/models/staging/stg_issues.sql
++++ b/dbt_project/models/staging/stg_issues.sql
+@@ -16,7 +16,12 @@ renamed as (
+         cast(created_at as timestamp) as created_at,
+         cast(updated_at as timestamp) as updated_at,
+         cast(closed_at as timestamp) as closed_at,
+-        pull_request is not null as is_pull_request,
++        -- `pull_request` only exists when the extraction contains at least one PR.
++        {% if has_column(source('github', 'raw_issues'), 'pull_request') -%}
++            pull_request is not null
++        {%- else -%}
++            false
++        {%- endif %} as is_pull_request,
+         cast(comments as integer) as comment_count,
+         html_url
+     from source
+diff --git a/scripts/generate_fixture.py b/scripts/generate_fixture.py
+index 8933b37..df439d8 100644
+--- a/scripts/generate_fixture.py
++++ b/scripts/generate_fixture.py
+@@ -16,9 +16,14 @@ from pathlib import Path
+ from extract.github_extract import iso, repo_slug
+ from pipeline_common.config import ROOT, load_config
+ 
+-SNAPSHOT = datetime(2026, 9, 1, tzinfo=UTC)
++# Anchored to the current hour rather than a fixed date, so the sync's freshness guard
++# (max_snapshot_age_hours) sees a live snapshot. A hard-coded date makes every dry run warn
++# that a live run would refuse, and the warning grows daily. Contents stay deterministic:
++# the seeded RNG draws the same offsets, so only the anchor moves. Use --as-of to rebuild
++# an exact historical fixture.
++SNAPSHOT = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+ WINDOW_DAYS = 180
+-RUN_ID = "20260901T000000Z"
++RUN_ID = SNAPSHOT.strftime("%Y%m%dT%H%M%SZ")
+ LABELS = ["bug", "enhancement", "documentation", "triage", "needs-repro"]
+ HUMANS = [f"dev_{i:02d}" for i in range(1, 13)]
+ BOTS = ["github-actions[bot]", "dependabot[bot]"]
+@@ -177,7 +182,13 @@ def write_repo(run_dir: Path, repo: str, window_start: datetime, issue_streams:
+ def main() -> None:
+     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+     ap.add_argument("--out", type=Path, default=ROOT / "data" / "sample" / "json")
++    ap.add_argument("--as-of", type=datetime.fromisoformat,
++                    help="anchor the fixture to this UTC time instead of now, e.g. 2026-09-01T00:00")
+     args = ap.parse_args()
++    if args.as_of:
++        global SNAPSHOT, RUN_ID
++        SNAPSHOT = args.as_of.replace(tzinfo=args.as_of.tzinfo or UTC)
++        RUN_ID = SNAPSHOT.strftime("%Y%m%dT%H%M%SZ")
+     cfg = load_config()
+     rng, ids = random.Random(42), Ids()
+     window_start = SNAPSHOT - timedelta(days=WINDOW_DAYS)
+@@ -185,7 +196,7 @@ def main() -> None:
+     for repo in ("example-org/widgets", "example-org/gadgets"):
+         write_repo(run_dir, repo, window_start, *public_repo(repo, rng, ids, window_start))
+     write_repo(run_dir, cfg.sandbox_repo, window_start, *sandbox_repo(cfg.sandbox_repo, ids))
+-    print(f"fixture written to {run_dir}")
++    print(f"fixture written to {run_dir} (snapshot {iso(SNAPSHOT)})")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_staging_optional_columns.py b/tests/test_staging_optional_columns.py
+new file mode 100644
+index 0000000..5598b06
+--- /dev/null
++++ b/tests/test_staging_optional_columns.py
+@@ -0,0 +1,103 @@
++"""GitHub omits optional keys instead of nulling them, so the Parquet schema varies by extraction.
++
++`pull_request` appears only on pull requests and `label` only on labeled/unlabeled events, so an
++extraction containing neither (a sandbox-only run, a narrow window, a --max-pages sample) lands
++Parquet without those columns. The staging models must still build.
++"""
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import duckdb
++import pytest
++
++from extract import to_parquet
++from load.load_to_duckdb import load
++from pipeline_common.config import ROOT
++
++REPO = "example-org/plain"
++SLUG = "example-org__plain"
++RUN_ID = "20260101T000000Z"
++
++
++def _issue(number: int) -> dict:
++    """An ordinary issue: no `pull_request` key, exactly as the API returns for non-PRs."""
++    api = f"https://api.github.com/repos/{REPO}"
++    return {
++        "id": 900 + number, "number": number, "title": f"Issue {number}",
++        "url": f"{api}/issues/{number}", "repository_url": api,
++        "html_url": f"https://github.com/{REPO}/issues/{number}",
++        "user": {"login": "dev_01", "type": "User"}, "state": "open", "state_reason": None,
++        "comments": 0, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
++        "closed_at": None, "body": "b",
++    }
++
++
++def _event(number: int) -> dict:
++    """A `closed` event: carries no `label` key, unlike labeled/unlabeled events."""
++    return {
++        "id": 800 + number, "event": "closed", "actor": {"login": "dev_01", "type": "User"},
++        "created_at": "2026-01-02T00:00:00Z",
++        "issue": {"id": 900 + number, "number": number, "title": f"Issue {number}",
++                  "repository_url": f"https://api.github.com/repos/{REPO}",
++                  "html_url": f"https://github.com/{REPO}/issues/{number}", "state": "open"},
++    }
++
++
++def _comment(number: int) -> dict:
++    api = f"https://api.github.com/repos/{REPO}"
++    return {"id": 700 + number, "issue_url": f"{api}/issues/{number}",
++            "user": {"login": "dev_02", "type": "User"}, "body": "hi",
++            "created_at": "2026-01-03T00:00:00Z", "updated_at": "2026-01-03T00:00:00Z"}
++
++
++@pytest.fixture(scope="module")
++def warehouse(tmp_path_factory) -> Path:
++    """Land a run with no PRs and no label events, then load it into DuckDB."""
++    base = tmp_path_factory.mktemp("optional_cols")
++    repo_dir = base / "json" / "runs" / RUN_ID / SLUG
++    for entity, rows in [("issues", [_issue(1), _issue(2)]),
++                         ("comments", [_comment(1)]),
++                         ("events", [_event(1)])]:
++        (repo_dir / entity).mkdir(parents=True, exist_ok=True)
++        (repo_dir / entity / "page_windowed_0001.json").write_text(json.dumps(rows))
++    (repo_dir / "manifest.json").write_text(json.dumps({
++        "repo_full_name": REPO, "run_id": RUN_ID, "window_start": "2025-07-05T00:00:00Z",
++        "extracted_at": "2026-01-04T00:00:00Z", "truncated": False, "pages": {}, "records": {}}))
++
++    parquet = base / "parquet"
++    to_parquet.build(base / "json", parquet)
++    db = base / "w.duckdb"
++    load(db, parquet)
++    return db
++
++
++def test_parquet_really_lacks_the_optional_columns(warehouse):
++    """Guards the premise: if these columns appeared, the test below would prove nothing."""
++    with duckdb.connect(str(warehouse), read_only=True) as con:
++        issue_cols = {c[1] for c in con.execute("pragma table_info('raw.raw_issues')").fetchall()}
++        event_cols = {c[1] for c in con.execute("pragma table_info('raw.raw_events')").fetchall()}
++    assert "pull_request" not in issue_cols
++    assert "label" not in event_cols
++
++
++def test_dbt_build_succeeds_without_the_optional_columns(warehouse):
++    dbt = Path(sys.executable).with_name("dbt")
++    entrypoint = [str(dbt)] if dbt.exists() else [sys.executable, "-m", "dbt.cli.main"]
++    result = subprocess.run(
++        [*entrypoint, "--no-use-colors", "build",
++         "--project-dir", "dbt_project", "--profiles-dir", "dbt_project",
++         "--target-path", str(warehouse.parent / "target")],
++        cwd=ROOT, env={**os.environ, "DUCKDB_PATH": str(warehouse)},
++        capture_output=True, text=True,
++    )
++    assert result.returncode == 0, result.stdout[-4000:]
++    assert "Binder Error" not in result.stdout
++
++    with duckdb.connect(str(warehouse), read_only=True) as con:
++        assert con.execute("select count(*) from staging.stg_issues where is_pull_request").fetchone()[0] == 0
++        assert con.execute("select count(*) from staging.stg_events where label_name is not null").fetchone()[0] == 0

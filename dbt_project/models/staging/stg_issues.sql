@@ -16,7 +16,12 @@ renamed as (
         cast(created_at as timestamp) as created_at,
         cast(updated_at as timestamp) as updated_at,
         cast(closed_at as timestamp) as closed_at,
-        pull_request is not null as is_pull_request,
+        -- `pull_request` only exists when the extraction contains at least one PR.
+        {% if has_column(source('github', 'raw_issues'), 'pull_request') -%}
+            pull_request is not null
+        {%- else -%}
+            false
+        {%- endif %} as is_pull_request,
         cast(comments as integer) as comment_count,
         html_url
     from source

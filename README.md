@@ -1,5 +1,7 @@
 # GitHub ELT + Reverse ETL
 
+[![ci](https://github.com/Darren-Murphy-mtn/Reverse-ETL/actions/workflows/ci.yml/badge.svg)](https://github.com/Darren-Murphy-mtn/Reverse-ETL/actions/workflows/ci.yml)
+
 A small, complete data pipeline over GitHub issue activity. It **extracts** issues, comments, and events from the GitHub REST API, **loads** them untouched into DuckDB, **transforms** them with dbt into tested marts, then runs **reverse ETL**: each row of `fct_stale_issues` becomes a task in a ClickUp list.
 
 GitHub is read-only. The warehouse computes something no single API call can (last *human* activity, excluding bots), and pushes that answer to where someone would act on it.
@@ -27,10 +29,13 @@ This is a portfolio-scale project built with free, local tooling. It's meant to 
                                    marts.fct_stale_issues
                                               │
       reverse_etl/sync_stale_issues.py        ▼
-          dry-run by default · one ClickUp list · idempotent · freshness-guarded · logged
+          dry-run by default · idempotent · freshness-guarded · rate-limit aware · logged
                               │
+      reverse_etl/organize_clickup.py    folder + one list per repo · tags · priority
+                              │
+      reverse_etl/backfill_dates.py      start date (GitHub created) · due (stale by)
                               ▼
-                  ClickUp list (one task per stale issue)
+            ClickUp folder "Stale issues" — one task per stale issue
 ```
 
 `pytorch/pytorch` is not in the extract. Its quiet-open set is about 13,000 issues, which is the wrong volume to write into one demo list. The window is 30 days, the shortest span that still supports the 30-day stale rule.

@@ -12,7 +12,12 @@ renamed as (
         coalesce(actor.login, 'ghost') as actor,
         coalesce(actor.type = 'Bot', false) as actor_is_bot,
         cast(created_at as timestamp) as created_at,
-        label.name as label_name
+        -- `label` only exists when the extraction contains a labeled/unlabeled event.
+        {% if has_column(source('github', 'raw_events'), 'label') -%}
+            label.name
+        {%- else -%}
+            cast(null as varchar)
+        {%- endif %} as label_name
     from source
 )
 

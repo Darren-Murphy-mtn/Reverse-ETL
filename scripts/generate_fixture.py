@@ -16,9 +16,14 @@ from pathlib import Path
 from extract.github_extract import iso, repo_slug
 from pipeline_common.config import ROOT, load_config
 
-SNAPSHOT = datetime(2026, 9, 1, tzinfo=UTC)
+# Anchored to the current hour rather than a fixed date, so the sync's freshness guard
+# (max_snapshot_age_hours) sees a live snapshot. A hard-coded date makes every dry run warn
+# that a live run would refuse, and the warning grows daily. Contents stay deterministic:
+# the seeded RNG draws the same offsets, so only the anchor moves. Use --as-of to rebuild
+# an exact historical fixture.
+SNAPSHOT = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
 WINDOW_DAYS = 180
-RUN_ID = "20260901T000000Z"
+RUN_ID = SNAPSHOT.strftime("%Y%m%dT%H%M%SZ")
 LABELS = ["bug", "enhancement", "documentation", "triage", "needs-repro"]
 HUMANS = [f"dev_{i:02d}" for i in range(1, 13)]
 BOTS = ["github-actions[bot]", "dependabot[bot]"]
@@ -177,7 +182,13 @@ def write_repo(run_dir: Path, repo: str, window_start: datetime, issue_streams: 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", type=Path, default=ROOT / "data" / "sample" / "json")
+    ap.add_argument("--as-of", type=datetime.fromisoformat,
+                    help="anchor the fixture to this UTC time instead of now, e.g. 2026-09-01T00:00")
     args = ap.parse_args()
+    if args.as_of:
+        global SNAPSHOT, RUN_ID
+        SNAPSHOT = args.as_of.replace(tzinfo=args.as_of.tzinfo or UTC)
+        RUN_ID = SNAPSHOT.strftime("%Y%m%dT%H%M%SZ")
     cfg = load_config()
     rng, ids = random.Random(42), Ids()
     window_start = SNAPSHOT - timedelta(days=WINDOW_DAYS)
@@ -185,7 +196,7 @@ def main() -> None:
     for repo in ("example-org/widgets", "example-org/gadgets"):
         write_repo(run_dir, repo, window_start, *public_repo(repo, rng, ids, window_start))
     write_repo(run_dir, cfg.sandbox_repo, window_start, *sandbox_repo(cfg.sandbox_repo, ids))
-    print(f"fixture written to {run_dir}")
+    print(f"fixture written to {run_dir} (snapshot {iso(SNAPSHOT)})")
 
 
 if __name__ == "__main__":
