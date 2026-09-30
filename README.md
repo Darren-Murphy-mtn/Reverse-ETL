@@ -143,8 +143,16 @@ pipeline_common/             config loading, GitHub client, ClickUp client
 extract/                     API → raw JSON → Parquet
 load/                        Parquet → DuckDB raw.*
 dbt_project/                 staging / intermediate / marts, macros, singular tests
-reverse_etl/                 sync_stale_issues.py
+reverse_etl/                 sync_stale_issues.py, organize_clickup.py, backfill_dates.py
 scripts/                     synthetic fixture generator, lineage renderer
 tests/                       Python unit tests
 .github/workflows/ci.yml     lint + unit tests + fixture dbt build
 ```
+
+## How it was built
+
+A three-day build. I worked the design out by voice first — brain-dumping into Claude and
+arguing through the decisions rather than writing a spec: what "activity" should exclude and
+why, whether the destination should be GitHub or the place people actually work, and where
+the free plan's limits would force a real choice instead of a workaround. The tradeoffs in
+the sections above came out of that. Every number in this README is from a run I did.

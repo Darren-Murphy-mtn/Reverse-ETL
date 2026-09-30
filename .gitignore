@@ -22,3 +22,7 @@ __pycache__/
 .ruff_cache/
 _To_Delete/
 _To_Delete/
+
+# local patch files
+*.diff
+*.patch
