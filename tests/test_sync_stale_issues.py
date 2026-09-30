@@ -3,48 +3,51 @@ from pathlib import Path
 
 import pytest
 
-from pipeline_common.config import Config, ReverseEtlConfig
-from pipeline_common.github_client import GitHubClient
+from pipeline_common.clickup_client import ClickUpClient
 from reverse_etl.sync_stale_issues import (
-    BLOCKED,
-    POST,
     SKIP_LIVE,
-    SKIP_WAREHOUSE,
     SnapshotTooOld,
     StaleIssue,
     SyncLog,
     check_snapshot_freshness,
     execute_live,
-    plan,
-    render_comment,
+    render_description,
 )
 from tests.conftest import FakeSession, make_response
 
-SANDBOX = "me/sandbox"
-MARKER = "<!-- reverse-etl:stale-flag -->"
 NOW = datetime(2026, 9, 27, 12, tzinfo=UTC)
 
 
-def issue(n: int, repo: str = SANDBOX, flagged: bool = False, lower_bound: bool = False,
-          age_h: float = 1) -> StaleIssue:
-    return StaleIssue(f"{repo}#{n}", repo, n, f"title {n}", f"https://github.com/{repo}/issues/{n}", 45,
-                      lower_bound, 30, flagged, (NOW - timedelta(hours=age_h)).replace(tzinfo=None))
+def issue(n: int, repo: str = "vercel/next.js", lower_bound: bool = False, age_h: float = 1) -> StaleIssue:
+    return StaleIssue(
+        f"{repo}#{n}",
+        repo,
+        n,
+        f"title {n}",
+        f"https://github.com/{repo}/issues/{n}",
+        45,
+        lower_bound,
+        30,
+        False,
+        (NOW - timedelta(hours=age_h)).replace(tzinfo=None),
+    )
 
 
-def cfg(tmp_path: Path) -> Config:
-    return Config([], SANDBOX, 180, tmp_path, tmp_path, tmp_path / "w.duckdb", tmp_path / "logs",
-                  ReverseEtlConfig(MARKER, "stale", 24, 0))
-
-
-def test_plan_blocks_everything_outside_the_allowlist():
-    decisions = plan([issue(1), issue(2, flagged=True), issue(3, repo="vercel/next.js")], {SANDBOX})
-    assert [d for _, d in decisions] == [POST, SKIP_WAREHOUSE, BLOCKED]
-
-
-def test_comment_carries_marker_and_lower_bound_wording():
-    body = render_comment(issue(1, lower_bound=True), MARKER)
-    assert body.startswith(MARKER)
-    assert "at least 45 days" in body
+def test_description_has_repo_url_and_dates():
+    created = datetime(2024, 1, 2, tzinfo=UTC)
+    last = datetime(2026, 8, 1, tzinfo=UTC)
+    sample = issue(1, lower_bound=True)
+    dated = StaleIssue(
+        sample.issue_id, sample.repo_full_name, sample.issue_number, sample.title, sample.html_url,
+        sample.days_since_last_activity, True, sample.stale_threshold_days, False, sample.snapshot_at,
+        created, last,
+    )
+    text = render_description(dated)
+    assert "repo: vercel/next.js" in text
+    assert "issue URL: https://github.com/vercel/next.js/issues/1" in text
+    assert "github created: 2024-01-02" in text
+    assert "stale by: 2026-08-31 (lower bound)" in text
+    assert "days stale" not in text
 
 
 def test_freshness_guard():
@@ -53,47 +56,39 @@ def test_freshness_guard():
         check_snapshot_freshness([issue(1, age_h=30)], 24, NOW)
 
 
-def live_router(flagged_numbers: set[int], fail_comment_on: set[int] = frozenset()):
+def router(existing_urls: set[str], fail_on: set[int] = frozenset()):
     def route(method, url, kw):
-        n = int(url.split("/issues/")[1].split("/")[0]) if "/issues/" in url else None
-        if method == "GET" and url.endswith("/comments"):
-            body = [{"body": f"{MARKER}\nold flag"}] if n in flagged_numbers else [{"body": "hi"}]
-            return make_response(200, body)
-        if method == "GET" and "/labels/" in url:
-            return make_response(404, {"message": "Not Found"})
-        if method == "POST" and url.endswith("/comments") and n in fail_comment_on:
-            return make_response(422, {"message": "Validation Failed"})
-        return make_response(201, {"html_url": url})
+        if method == "GET":
+            tasks = [{"description": f"issue URL: {item}\n"} for item in existing_urls]
+            return make_response(200, {"tasks": tasks})
+        number = int(kw["json"]["description"].split("/issues/")[1].split()[0])
+        if number in fail_on:
+            return make_response(400, {"err": "nope", "ECODE": "TASK_001"})
+        return make_response(200, {"id": f"task-{number}", "url": f"https://app.clickup.com/t/task-{number}"})
+
     return route
 
 
-def run_live(tmp_path, decisions, router):
-    session = FakeSession(router)
-    client = GitHubClient(session=session, sleep=lambda s: None)
+def run_live(tmp_path: Path, issues: list[StaleIssue], route):
+    session = FakeSession(route)
+    client = ClickUpClient("pk_test", session=session, sleep=lambda s: None)
     sync_log = SyncLog(tmp_path / "logs", NOW)
-    counts = execute_live(decisions, client, cfg(tmp_path), sync_log, apply_label=True, sleep=lambda s: None)
+    counts = execute_live(issues, client, "123", sync_log)
     return counts, session, sync_log
 
 
-def test_live_sync_is_idempotent_against_live_state(tmp_path):
-    decisions = plan([issue(1), issue(2)], {SANDBOX})
-    counts, session, _ = run_live(tmp_path, decisions, live_router(flagged_numbers={2}))
-    posts = [(m, u) for m, u, _ in session.calls if m == "POST"]
+def test_live_sync_skips_urls_already_in_a_task(tmp_path):
+    issues = [issue(1), issue(2)]
+    counts, session, _ = run_live(tmp_path, issues, router({issues[1].html_url}))
+    posts = [kw["json"]["name"] for method, _, kw in session.calls if method == "POST"]
     assert counts[SKIP_LIVE] == 1
-    assert counts["comment:ok"] == 1 and counts["label:ok"] == 1
-    assert not any("/issues/2/" in u for _, u in posts)
-    assert any(u.endswith(f"/repos/{SANDBOX}/labels") for _, u in posts)  # label created once when missing
+    assert counts["create:ok"] == 1
+    assert posts == ["title 1"]
 
 
-def test_live_sync_never_calls_api_for_blocked_rows(tmp_path):
-    decisions = plan([issue(9, repo="pytorch/pytorch")], {SANDBOX})
-    counts, session, _ = run_live(tmp_path, decisions, live_router(set()))
-    assert session.calls == []
-    assert counts[BLOCKED] == 1
-
-
-def test_failed_comment_is_logged_and_label_is_not_applied(tmp_path):
-    decisions = plan([issue(1)], {SANDBOX})
-    counts, session, sync_log = run_live(tmp_path, decisions, live_router(set(), fail_comment_on={1}))
-    assert counts["comment:error"] == 1 and counts["label:ok"] == 0
+def test_failed_create_is_logged_and_later_issues_still_run(tmp_path):
+    issues = [issue(1), issue(2)]
+    counts, _, sync_log = run_live(tmp_path, issues, router(set(), fail_on={1}))
+    assert counts["create:error"] == 1
+    assert counts["create:ok"] == 1
     assert '"status": "error"' in sync_log.path.read_text()

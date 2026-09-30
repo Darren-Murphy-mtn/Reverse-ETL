@@ -1,5 +1,6 @@
 # secrets
 .env
+/Untitled
 
 # pipeline outputs (regenerable; raw JSON is kept locally as the audit trail)
 data/
@@ -19,3 +20,5 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+_To_Delete/
+_To_Delete/

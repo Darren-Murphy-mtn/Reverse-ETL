@@ -132,7 +132,7 @@ def public_repo(repo: str, rng: random.Random, ids: Ids, window_start: datetime)
 
 
 def sandbox_repo(repo: str, ids: Ids):
-    """Mirrors what reverse_etl/seed_sandbox.py creates: recent, mostly-open synthetic issues."""
+    """Recent, mostly-open synthetic issues for the sandbox repo in the fixture."""
     base = SNAPSHOT - timedelta(days=6)
     issues, comments, events = [], [], []
     for number in range(1, 9):

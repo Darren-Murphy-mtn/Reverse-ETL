@@ -2,16 +2,19 @@
 # dbt-side thresholds live in dbt_project/dbt_project.yml (vars); tests/test_config_consistency.py
 # fails CI if the two drift.
 
+# pytorch/pytorch is omitted. Its quiet-open set is about 13,000 issues, which is the
+# wrong volume for a demo write into one ClickUp list.
 source_repos:
   - vercel/next.js
-  - pytorch/pytorch
   - dbt-labs/dbt-core
 
-# The only repo the pipeline is ever allowed to write to. It is also extracted,
-# so the loop closes on the same repo: GitHub -> warehouse -> GitHub.
+# Extracted with the sources so the dbt sandbox threshold still has a repo to attach to.
+# The sync does not write to GitHub.
 sandbox_repo: Darren-Murphy-mtn/Reverse-ETL-sandbox
 
-window_days: 180
+# 30 days is the shortest window that still supports the 30-day stale rule. A shorter
+# window can only prove "at least N days" with N below the threshold, so the mart is empty.
+window_days: 30
 
 paths:
   raw_json: data/raw/json

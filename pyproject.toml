@@ -1,7 +1,7 @@
 [project]
 name = "github-reverse-etl"
 version = "0.1.0"
-description = "ELT + reverse-ETL loop over GitHub issues: extract, load to DuckDB, model with dbt, write insight back to GitHub."
+description = "ELT + reverse-ETL loop over GitHub issues: extract, load to DuckDB, model with dbt, create a ClickUp task per stale issue."
 requires-python = ">=3.11"
 
 [tool.ruff]

@@ -3,7 +3,7 @@ DBT      = dbt --no-use-colors
 DBT_ARGS = --project-dir dbt_project --profiles-dir dbt_project
 export DUCKDB_PATH ?= warehouse.duckdb
 
-.PHONY: help install extract load transform docs lineage sync sync-live seed seed-live pipeline \
+.PHONY: help install extract load transform docs lineage sync sync-live pipeline \
         fixture ci test lint
 
 help:  ## list targets
@@ -27,17 +27,11 @@ docs:  ## generate and serve dbt docs (lineage graph)
 lineage:  ## regenerate the Mermaid lineage diagram in docs/lineage.md from the dbt manifest
 	$(DBT) parse $(DBT_ARGS) && $(PY) -m scripts.render_lineage
 
-sync:  ## reverse ETL, dry run (no API calls)
+sync:  ## reverse ETL, dry run (prints ClickUp tasks, no API calls)
 	$(PY) -m reverse_etl.sync_stale_issues
 
-sync-live:  ## reverse ETL, live (sandbox repo only, needs GITHUB_WRITE_TOKEN)
+sync-live:  ## reverse ETL, live (CLICKUP_LIST_ID only, needs CLICKUP_API_KEY)
 	$(PY) -m reverse_etl.sync_stale_issues --live
-
-seed:  ## preview synthetic sandbox issues (dry run)
-	$(PY) -m reverse_etl.seed_sandbox
-
-seed-live:  ## create synthetic sandbox issues (needs GITHUB_WRITE_TOKEN)
-	$(PY) -m reverse_etl.seed_sandbox --live
 
 pipeline: extract load transform sync  ## full loop, sync in dry-run mode
 

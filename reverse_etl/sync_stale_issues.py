@@ -1,9 +1,8 @@
-"""Reverse ETL: push fct_stale_issues from the warehouse back into GitHub.
+"""Reverse ETL: create one ClickUp task per row in marts.fct_stale_issues.
 
-Dry-run by default: prints the plan and makes no API calls. With --live it only ever writes to
-the configured sandbox repo. It re-checks each issue for the marker comment before posting
-(the warehouse is a snapshot and may be behind), refuses to run on stale snapshots, and logs
-every write attempt as JSON lines under logs/reverse_etl/.
+Dry-run by default: prints the plan and makes no API calls. With --live it reads
+CLICKUP_LIST_ID, skips any issue whose URL is already in a task description (closed
+tasks included), and logs every write attempt under logs/reverse_etl/.
 """
 from __future__ import annotations
 
@@ -11,24 +10,23 @@ import argparse
 import json
 import logging
 import sys
-import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 
-from pipeline_common.config import Config, env_token, load_config
-from pipeline_common.github_client import GitHubClient, GitHubError
+from pipeline_common.clickup_client import ClickUpClient, ClickUpError
+from pipeline_common.config import env_token, load_config
 from pipeline_common.log import setup_logging
+from reverse_etl.organize_clickup import scan_list_ids as discover_lists
 
 log = logging.getLogger("reverse_etl")
 
-POST = "post"
-SKIP_WAREHOUSE = "skip:already_flagged(warehouse)"
-SKIP_LIVE = "skip:already_flagged(live)"
-BLOCKED = "blocked:not_in_write_allowlist"
+CREATE = "create"
+SKIP_LIVE = "skip:already_in_clickup"
+_TEXT_FIELDS = ("description", "text_content", "markdown_description")
 
 
 @dataclass(frozen=True)
@@ -43,6 +41,8 @@ class StaleIssue:
     stale_threshold_days: int
     has_stale_flag: bool
     snapshot_at: datetime
+    created_at: datetime | None = None
+    last_activity_at: datetime | None = None
 
 
 class SnapshotTooOld(RuntimeError):
@@ -71,29 +71,25 @@ def check_snapshot_freshness(issues: list[StaleIssue], max_age_hours: float, now
         )
 
 
-def plan(issues: list[StaleIssue], allowlist: set[str]) -> list[tuple[StaleIssue, str]]:
-    decisions = []
-    for issue in issues:
-        if issue.repo_full_name not in allowlist:
-            decisions.append((issue, BLOCKED))
-        elif issue.has_stale_flag:
-            decisions.append((issue, SKIP_WAREHOUSE))
-        else:
-            decisions.append((issue, POST))
-    return decisions
+def stale_by(issue: StaleIssue) -> datetime | None:
+    if issue.last_activity_at is None:
+        return None
+    return issue.last_activity_at + timedelta(days=issue.stale_threshold_days)
 
 
-def render_comment(issue: StaleIssue, marker: str) -> str:
-    days = f"at least {issue.days_since_last_activity}" if issue.last_activity_is_lower_bound \
-        else str(issue.days_since_last_activity)
-    return (
-        f"{marker}\n"
-        f"**Stale issue flag** (automated reverse-ETL sync)\n\n"
-        f"No human activity for **{days} days** as of the warehouse snapshot taken "
-        f"{issue.snapshot_at:%Y-%m-%d %H:%M} UTC. The threshold for this repo is "
-        f"{issue.stale_threshold_days} days.\n\n"
-        f"_Computed in `fct_stale_issues`; bot activity and this pipeline's own writes don't count._"
-    )
+def render_description(issue: StaleIssue) -> str:
+    lines = [f"repo: {issue.repo_full_name}", f"issue URL: {issue.html_url}"]
+    if issue.created_at is not None:
+        lines.append(f"github created: {issue.created_at:%Y-%m-%d}")
+    became_stale = stale_by(issue)
+    if became_stale is not None:
+        bound = " (lower bound)" if issue.last_activity_is_lower_bound else ""
+        lines.append(f"stale by: {became_stale:%Y-%m-%d}{bound}")
+    return "\n".join(lines)
+
+
+def task_text(task: dict) -> str:
+    return "\n".join(str(task.get(field) or "") for field in _TEXT_FIELDS)
 
 
 class SyncLog:
@@ -107,115 +103,122 @@ class SyncLog:
             f.write(json.dumps(entry, default=str) + "\n")
 
 
-def already_flagged_live(client: GitHubClient, issue: StaleIssue, marker: str) -> bool:
-    path = f"/repos/{issue.repo_full_name}/issues/{issue.issue_number}/comments"
-    return any(marker in (c.get("body") or "") for page in client.paginate(path, {"per_page": 100}) for c in page)
-
-
-def ensure_label(client: GitHubClient, repo: str, label: str, sync_log: SyncLog) -> None:
-    try:
-        client.get_json(f"/repos/{repo}/labels/{label}")
-    except GitHubError as e:
-        if e.status != 404:
-            raise
-        payload = {"name": label, "color": "cfd3d7", "description": "Flagged by the reverse-ETL stale-issue sync"}
-        resp = client.post_json(f"/repos/{repo}/labels", payload)
-        sync_log.write(action="create_label", repo=repo, request=payload, status="ok", response_url=resp.get("url"))
-
-
 def execute_live(
-    decisions: list[tuple[StaleIssue, str]], client: GitHubClient, cfg: Config, sync_log: SyncLog,
-    apply_label: bool, sleep=time.sleep,
+    issues: list[StaleIssue],
+    client: ClickUpClient,
+    list_id: str,
+    sync_log: SyncLog,
+    scan_list_ids: list[str] | None = None,
 ) -> Counter:
-    rcfg = cfg.reverse_etl
+    # Tasks are filed into per-repo lists after create. Scan those too, or a rerun duplicates them.
+    ids = scan_list_ids or [list_id]
+    existing = [task_text(task) for lid in ids for page in client.iter_task_pages(lid) for task in page]
     counts: Counter = Counter()
-    labelled_repos: set[str] = set()
-    for issue, decision in decisions:
-        if decision != POST:
-            counts[decision] += 1
-            continue
-        if already_flagged_live(client, issue, rcfg.marker):
+    consecutive_errors = 0
+    for issue in issues:
+        description = render_description(issue)
+        if any(issue.html_url in text for text in existing):
             counts[SKIP_LIVE] += 1
-            sync_log.write(action="skip", reason=SKIP_LIVE, issue_id=issue.issue_id)
+            sync_log.write(action="skip", reason=SKIP_LIVE, issue_id=issue.issue_id, issue_url=issue.html_url)
             continue
-        base = f"/repos/{issue.repo_full_name}/issues/{issue.issue_number}"
-        writes = [("comment", f"{base}/comments", {"body": render_comment(issue, rcfg.marker)})]
-        if apply_label:
-            if issue.repo_full_name not in labelled_repos:
-                ensure_label(client, issue.repo_full_name, rcfg.stale_label, sync_log)
-                labelled_repos.add(issue.repo_full_name)
-            writes.append(("label", f"{base}/labels", {"labels": [rcfg.stale_label]}))
-        for kind, path, payload in writes:
-            try:
-                resp = client.post_json(path, payload)
-                ref = resp.get("html_url") if isinstance(resp, dict) else None
-                sync_log.write(action=kind, issue_id=issue.issue_id, request=payload, status="ok", response_url=ref)
-                counts[f"{kind}:ok"] += 1
-            except GitHubError as e:
-                sync_log.write(action=kind, issue_id=issue.issue_id, request=payload, status="error",
-                               http_status=e.status, error=str(e))
-                counts[f"{kind}:error"] += 1
-                log.error("%s failed for %s: %s", kind, issue.issue_id, e)
-                break  # don't label an issue whose comment failed
-            sleep(rcfg.write_delay_seconds)  # stay under GitHub's content-creation secondary limits
+        payload = {"name": issue.title, "description": description}
+        try:
+            resp = client.create_task(list_id, issue.title, description)
+            sync_log.write(
+                action="create",
+                issue_id=issue.issue_id,
+                request=payload,
+                status="ok",
+                task_id=resp.get("id"),
+                response_url=resp.get("url"),
+            )
+            counts["create:ok"] += 1
+            consecutive_errors = 0
+            existing.append(description)
+            if counts["create:ok"] % 50 == 0:
+                log.info(
+                    "created %s so far (%s skipped, %s errors)",
+                    counts["create:ok"],
+                    counts[SKIP_LIVE],
+                    counts["create:error"],
+                )
+        except ClickUpError as e:
+            sync_log.write(
+                action="create",
+                issue_id=issue.issue_id,
+                request=payload,
+                status="error",
+                http_status=e.status,
+                error=str(e),
+            )
+            counts["create:error"] += 1
+            consecutive_errors += 1
+            log.error("create failed for %s: %s", issue.issue_id, e)
+            if consecutive_errors >= 5:
+                log.error("stopping after %s consecutive create failures", consecutive_errors)
+                break
     return counts
 
 
-def print_plan(decisions: list[tuple[StaleIssue, str]], marker: str) -> None:
-    for issue, decision in decisions:
-        days = f">={issue.days_since_last_activity}" if issue.last_activity_is_lower_bound \
+def print_plan(issues: list[StaleIssue]) -> None:
+    for issue in issues:
+        days = (
+            f">={issue.days_since_last_activity}"
+            if issue.last_activity_is_lower_bound
             else str(issue.days_since_last_activity)
-        print(f"{decision:<34} {issue.issue_id:<52} {days:>5}d  {issue.title[:60]}")
-    sample = next((i for i, d in decisions if d == POST), None)
-    if sample:
-        print(f"\n--- comment that would be posted on {sample.issue_id} ---\n{render_comment(sample, marker)}\n")
+        )
+        print(f"{CREATE:<28} {issue.issue_id:<52} {days:>6}d  {issue.title[:60]}")
+    if issues:
+        print(f"\n--- task description for {issues[0].issue_id} ---\n{render_description(issues[0])}\n")
 
 
 def main(argv: list[str] | None = None) -> int:
     setup_logging()
     cfg = load_config()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--live", action="store_true", help="actually write to GitHub (sandbox repo only)")
-    ap.add_argument("--limit", type=int, help="max issues to write in this run")
-    ap.add_argument("--no-label", action="store_true", help="post comments only, don't apply the stale label")
+    ap.add_argument("--live", action="store_true", help="create ClickUp tasks in CLICKUP_LIST_ID")
+    ap.add_argument("--limit", type=int, help="max tasks to create in this run")
     ap.add_argument("--allow-stale-snapshot", action="store_true")
     ap.add_argument("--warehouse", type=Path, default=cfg.warehouse)
     args = ap.parse_args(argv)
 
     issues = fetch_stale_issues(args.warehouse)
-    decisions = plan(issues, allowlist={cfg.sandbox_repo})
     if args.limit is not None:
-        posts = [d for d in decisions if d[1] == POST][: args.limit]
-        decisions = [d for d in decisions if d[1] != POST] + posts
+        issues = issues[: args.limit]
     now = datetime.now(UTC)
-    to_post = [i for i, d in decisions if d == POST]
     max_age = cfg.reverse_etl.max_snapshot_age_hours
 
     if not args.live:
-        print_plan(decisions, cfg.reverse_etl.marker)
-        summary = Counter(d for _, d in decisions)
-        log.info("DRY RUN, no API calls made. %s", dict(summary))
+        print_plan(issues)
+        log.info("DRY RUN, no API calls made. %s candidate task(s).", len(issues))
         try:
-            check_snapshot_freshness(to_post, max_age, now)
+            check_snapshot_freshness(issues, max_age, now)
         except SnapshotTooOld as e:
             log.warning("a live run would refuse: %s", e)
         return 0
 
-    token = env_token("GITHUB_WRITE_TOKEN")
-    if not token:
-        log.error("--live requires GITHUB_WRITE_TOKEN (fine-grained, Issues: read/write, sandbox repo only)")
+    token = env_token("CLICKUP_API_KEY")
+    list_id = env_token("CLICKUP_LIST_ID")
+    if not token or not list_id:
+        log.error("--live requires CLICKUP_API_KEY and CLICKUP_LIST_ID")
         return 2
     if not args.allow_stale_snapshot:
         try:
-            check_snapshot_freshness(to_post, max_age, now)
+            check_snapshot_freshness(issues, max_age, now)
         except SnapshotTooOld as e:
             log.error("%s", e)
             return 3
 
     sync_log = SyncLog(cfg.sync_logs, now)
-    counts = execute_live(decisions, GitHubClient(token=token), cfg, sync_log, apply_label=not args.no_label)
+    client = ClickUpClient(token)
+    try:
+        scan_ids = discover_lists(client, list_id)
+    except ClickUpError as e:
+        log.warning("could not list the Stale issues folder, scanning the primary list only: %s", e)
+        scan_ids = [list_id]
+    counts = execute_live(issues, client, list_id, sync_log, scan_list_ids=scan_ids)
     log.info("LIVE sync finished: %s (log: %s)", dict(counts), sync_log.path)
-    return 1 if any(k.endswith(":error") for k in counts) else 0
+    return 1 if counts["create:error"] else 0
 
 
 if __name__ == "__main__":
