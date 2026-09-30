@@ -1,4 +1,6 @@
-from pipeline_common.clickup_client import ClickUpClient
+import pytest
+
+from pipeline_common.clickup_client import ClickUpClient, ClickUpError
 from tests.conftest import FakeSession, make_response
 
 
@@ -40,3 +42,28 @@ def test_sleeps_until_reset_on_429(clock):
     created = client.create_task("9", "name", "desc")
     assert created["id"] == "t"
     assert clock.slept == [31]
+
+
+def test_server_error_on_a_create_is_not_retried(clock):
+    """A 5xx create may already have been applied; replaying it would make a second task."""
+    attempts = []
+
+    def route(method, url, kw):
+        attempts.append(method)
+        return make_response(502, {"err": "Bad gateway"})
+
+    session = FakeSession(route)
+    client = ClickUpClient("pk_test", session=session, sleep=clock.sleep, clock=clock.time)
+    with pytest.raises(ClickUpError, match="may already have been applied") as err:
+        client.create_task("9", "name", "desc")
+    assert err.value.status == 502
+    assert attempts == ["POST"]  # sent exactly once
+    assert clock.slept == []
+
+
+def test_server_errors_on_reads_are_still_retried(clock):
+    responses = iter([make_response(503, {}), make_response(200, {"tasks": []})])
+    session = FakeSession(lambda m, u, k: next(responses))
+    client = ClickUpClient("pk_test", session=session, sleep=clock.sleep, clock=clock.time)
+    assert list(client.iter_task_pages("9")) == [[]]
+    assert clock.slept == [1]

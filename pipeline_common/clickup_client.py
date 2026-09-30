@@ -10,6 +10,9 @@ import requests
 
 API_ROOT = "https://api.clickup.com/api/v2"
 PAGE_SIZE = 100
+# Safe to replay after a server error. A write is not: ClickUp may have applied it
+# before the response was lost, so replaying creates a second task.
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
 log = logging.getLogger(__name__)
 
 
@@ -49,6 +52,15 @@ class ClickUpClient:
                 self._wait(self._reset_wait(resp), "rate limited (429)")
                 continue
             if resp.status_code >= 500:
+                # The dedupe scan in sync_stale_issues runs before each create, so it cannot
+                # see a duplicate produced by a retry inside one create. Surface the failure
+                # instead; the caller logs it per issue and moves on.
+                if method.upper() not in IDEMPOTENT_METHODS:
+                    raise ClickUpError(
+                        f"{method} {url} -> {resp.status_code}: not retried, the request may "
+                        f"already have been applied.",
+                        resp.status_code,
+                    )
                 self._wait(min(2**attempt, 60), f"server error {resp.status_code}")
                 continue
             self._throttle(resp)
